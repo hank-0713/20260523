@@ -17,7 +17,6 @@ PERIOD_DAYS = 365
 
 @app.before_request
 def _ensure_db():
-    """gunicorn 啟動後第一次收到請求時建立資料表。"""
     app.before_request_funcs[None].remove(_ensure_db)
     try:
         init_db()
@@ -70,27 +69,62 @@ def init_db():
 
 
 def _download(symbol, start, end):
-    df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=True)
+    """用 Ticker.history() 下載資料，欄位結構比 yf.download() 穩定。"""
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(start=start, end=end, auto_adjust=True)
     if df.empty:
         return pd.DataFrame()
     df.index.name = 'Date'
     df = df.reset_index()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+    required = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        return pd.DataFrame()
+    return df[required].copy()
+
+
+def _read_prices(conn, symbol):
+    """用 cursor 直接取資料，避免 pd.read_sql 在 pandas 2.x 的相容問題。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT trade_date, close_price FROM stock_prices "
+            "WHERE symbol=%s ORDER BY trade_date",
+            (symbol,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=['trade_date', 'close_price'])
+    df = pd.DataFrame(rows)
+    df['close_price'] = pd.to_numeric(df['close_price'], errors='coerce')
+    return df
+
+
+def _read_all_prices(conn, symbol):
+    """取全部欄位，供圖表使用。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT trade_date, open_price, high_price, low_price, close_price, volume "
+            "FROM stock_prices WHERE symbol=%s ORDER BY trade_date",
+            (symbol,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    for col in ['open_price', 'high_price', 'low_price', 'close_price']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
     return df
 
 
 def fetch_and_store():
     end = datetime.now()
     start = end - timedelta(days=PERIOD_DAYS + 30)
-    start_str = start.strftime('%Y-%m-%d')
-    end_str = end.strftime('%Y-%m-%d')
 
     conn = get_conn()
     rows_upserted = 0
 
     for _name, sym in SYMBOLS.items():
-        df = _download(sym, start_str, end_str)
+        df = _download(sym, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
         if df.empty:
             continue
         with conn.cursor() as cur:
@@ -99,7 +133,8 @@ def fetch_and_store():
                     cur.execute(
                         '''
                         INSERT INTO stock_prices
-                            (symbol, trade_date, open_price, high_price, low_price, close_price, volume)
+                            (symbol, trade_date, open_price, high_price,
+                             low_price, close_price, volume)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
                             open_price  = VALUES(open_price),
@@ -110,7 +145,7 @@ def fetch_and_store():
                         ''',
                         (
                             sym,
-                            row['Date'].strftime('%Y-%m-%d'),
+                            pd.Timestamp(row['Date']).strftime('%Y-%m-%d'),
                             float(row['Open']),
                             float(row['High']),
                             float(row['Low']),
@@ -123,31 +158,26 @@ def fetch_and_store():
                     pass
         conn.commit()
 
-    # 計算並記錄相關係數
-    tsmc_df = pd.read_sql(
-        "SELECT trade_date, close_price FROM stock_prices WHERE symbol='2330.TW' ORDER BY trade_date",
-        conn,
-    )
-    quanta_df = pd.read_sql(
-        "SELECT trade_date, close_price FROM stock_prices WHERE symbol='2382.TW' ORDER BY trade_date",
-        conn,
-    )
+    # 計算相關係數
+    tsmc_df = _read_prices(conn, '2330.TW')
+    quanta_df = _read_prices(conn, '2382.TW')
     merged = pd.merge(tsmc_df, quanta_df, on='trade_date', suffixes=('_tsmc', '_quanta'))
+    merged = merged.dropna()
 
     if len(merged) >= 3:
-        corr, pval = stats.pearsonr(
-            merged['close_price_tsmc'].astype(float),
-            merged['close_price_quanta'].astype(float),
-        )
+        x = merged['close_price_tsmc'].values.astype(float)
+        y = merged['close_price_quanta'].values.astype(float)
+        corr, pval = stats.pearsonr(x, y)
         with conn.cursor() as cur:
             cur.execute(
                 '''
-                INSERT INTO correlation_log (calc_date, period_days, correlation, p_value, data_points)
+                INSERT INTO correlation_log
+                    (calc_date, period_days, correlation, p_value, data_points)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    correlation  = VALUES(correlation),
-                    p_value      = VALUES(p_value),
-                    data_points  = VALUES(data_points)
+                    correlation = VALUES(correlation),
+                    p_value     = VALUES(p_value),
+                    data_points = VALUES(data_points)
                 ''',
                 (
                     datetime.now().strftime('%Y-%m-%d'),
@@ -181,20 +211,17 @@ def api_update():
 def api_chart_data():
     conn = get_conn()
 
-    tsmc_df = pd.read_sql(
-        "SELECT trade_date, close_price FROM stock_prices WHERE symbol='2330.TW' ORDER BY trade_date",
-        conn,
-    )
-    quanta_df = pd.read_sql(
-        "SELECT trade_date, close_price FROM stock_prices WHERE symbol='2382.TW' ORDER BY trade_date",
-        conn,
-    )
+    tsmc_df = _read_prices(conn, '2330.TW')
+    quanta_df = _read_prices(conn, '2382.TW')
     merged = pd.merge(tsmc_df, quanta_df, on='trade_date', suffixes=('_tsmc', '_quanta'))
+    merged = merged.dropna()
 
-    corr_row = pd.read_sql(
-        'SELECT * FROM correlation_log ORDER BY calc_date DESC, id DESC LIMIT 1',
-        conn,
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            'SELECT * FROM correlation_log ORDER BY calc_date DESC, id DESC LIMIT 1'
+        )
+        corr_row = cur.fetchone()
+
     conn.close()
 
     if merged.empty:
@@ -219,10 +246,10 @@ def api_chart_data():
         'tsmc_norm': norm_tsmc,
         'quanta_norm': norm_quanta,
         'rolling_corr': rolling_corr,
-        'correlation': float(corr_row['correlation'].iloc[0]) if not corr_row.empty else None,
-        'p_value': float(corr_row['p_value'].iloc[0]) if not corr_row.empty else None,
-        'data_points': int(corr_row['data_points'].iloc[0]) if not corr_row.empty else 0,
-        'last_updated': str(corr_row['calc_date'].iloc[0]) if not corr_row.empty else None,
+        'correlation': float(corr_row['correlation']) if corr_row else None,
+        'p_value': float(corr_row['p_value']) if corr_row else None,
+        'data_points': int(corr_row['data_points']) if corr_row else 0,
+        'last_updated': str(corr_row['calc_date']) if corr_row else None,
     })
 
 
