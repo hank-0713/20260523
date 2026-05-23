@@ -6,13 +6,13 @@ import pandas as pd
 import pymysql
 from flask import Flask, jsonify, render_template
 from pymysql.cursors import DictCursor
-from scipy import stats
 import yfinance as yf
 
 app = Flask(__name__)
 
 SYMBOLS = {'台積電': '2330.TW', '廣達': '2382.TW'}
 PERIOD_DAYS = 365
+VERSION = '2026-05-23-v3'
 
 
 @app.before_request
@@ -44,10 +44,10 @@ def init_db():
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 symbol VARCHAR(20) NOT NULL,
                 trade_date DATE NOT NULL,
-                open_price DECIMAL(12,4),
-                high_price DECIMAL(12,4),
-                low_price DECIMAL(12,4),
-                close_price DECIMAL(12,4),
+                open_price DOUBLE,
+                high_price DOUBLE,
+                low_price DOUBLE,
+                close_price DOUBLE,
                 volume BIGINT,
                 UNIQUE KEY uq_symbol_date (symbol, trade_date)
             ) DEFAULT CHARSET=utf8mb4
@@ -57,8 +57,8 @@ def init_db():
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 calc_date DATE NOT NULL,
                 period_days INT NOT NULL,
-                correlation DECIMAL(10,6),
-                p_value DECIMAL(10,8),
+                correlation DOUBLE,
+                p_value DOUBLE,
                 data_points INT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_calc_date (calc_date, period_days)
@@ -69,64 +69,93 @@ def init_db():
 
 
 def _download(symbol, start, end):
-    """用 Ticker.history() 下載資料，欄位結構比 yf.download() 穩定。"""
     ticker = yf.Ticker(symbol)
     df = ticker.history(start=start, end=end, auto_adjust=True)
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), 'empty dataframe from yfinance'
+    # 確保是 flat 欄位
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join(filter(None, c)) for c in df.columns]
     df.index.name = 'Date'
     df = df.reset_index()
-    required = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-    missing = [c for c in required if c not in df.columns]
+    # 找 Close 欄位（不同版本可能大小寫不同）
+    col_map = {c.lower(): c for c in df.columns}
+    needed = {'date': 'Date', 'open': 'Open', 'high': 'High',
+              'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
+    rename = {}
+    for lower, standard in needed.items():
+        if lower in col_map and col_map[lower] != standard:
+            rename[col_map[lower]] = standard
+    if rename:
+        df = df.rename(columns=rename)
+    missing = [c for c in needed.values() if c not in df.columns]
     if missing:
-        return pd.DataFrame()
-    return df[required].copy()
+        return pd.DataFrame(), f'missing columns: {missing}, got: {list(df.columns)}'
+    df = df[list(needed.values())].copy()
+    for col in ['Open', 'High', 'Low', 'Close']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['Volume'] = pd.to_numeric(df['Volume'], errors='coerce').fillna(0).astype(int)
+    df = df.dropna(subset=['Close'])
+    return df, None
 
 
 def _read_prices(conn, symbol):
-    """用 cursor 直接取資料，避免 pd.read_sql 在 pandas 2.x 的相容問題。"""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT trade_date, close_price FROM stock_prices "
-            "WHERE symbol=%s ORDER BY trade_date",
+            'SELECT trade_date, close_price FROM stock_prices '
+            'WHERE symbol=%s ORDER BY trade_date',
             (symbol,),
         )
         rows = cur.fetchall()
     if not rows:
         return pd.DataFrame(columns=['trade_date', 'close_price'])
     df = pd.DataFrame(rows)
-    df['close_price'] = pd.to_numeric(df['close_price'], errors='coerce')
+    # 轉成純 Python float，避免 Decimal 型別問題
+    df['close_price'] = [float(v) if v is not None else np.nan
+                         for v in df['close_price']]
     return df
 
 
-def _read_all_prices(conn, symbol):
-    """取全部欄位，供圖表使用。"""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT trade_date, open_price, high_price, low_price, close_price, volume "
-            "FROM stock_prices WHERE symbol=%s ORDER BY trade_date",
-            (symbol,),
-        )
-        rows = cur.fetchall()
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    for col in ['open_price', 'high_price', 'low_price', 'close_price']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    return df
+def _pearsonr(x, y):
+    """用 numpy 計算皮爾森相關係數，不依賴 scipy。"""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 3:
+        return 0.0, 1.0
+    r = float(np.corrcoef(x, y)[0, 1])
+    # 近似 p-value
+    n = len(x)
+    t = r * np.sqrt((n - 2) / max(1 - r ** 2, 1e-15))
+    from math import lgamma, exp, sqrt, pi
+    def betai(a, b, x):
+        if x < 0 or x > 1:
+            return 0.0
+        if x == 0:
+            return 0.0
+        if x == 1:
+            return 1.0
+        lbeta = lgamma(a) + lgamma(b) - lgamma(a + b)
+        return exp(a * np.log(x) + b * np.log(1 - x) - lbeta) / (a)
+    p = 2 * betai(0.5 * (n - 2), 0.5, (n - 2) / (t * t + n - 2)) if t != 0 else 1.0
+    return r, p
 
 
 def fetch_and_store():
     end = datetime.now()
     start = end - timedelta(days=PERIOD_DAYS + 30)
+    log = []
 
     conn = get_conn()
     rows_upserted = 0
 
-    for _name, sym in SYMBOLS.items():
-        df = _download(sym, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
-        if df.empty:
+    for name, sym in SYMBOLS.items():
+        df, err = _download(sym, start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))
+        if err:
+            log.append(f'{sym} download error: {err}')
             continue
+        log.append(f'{sym} downloaded {len(df)} rows, cols={list(df.columns)}')
         with conn.cursor() as cur:
             for _, row in df.iterrows():
                 try:
@@ -154,20 +183,22 @@ def fetch_and_store():
                         ),
                     )
                     rows_upserted += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.append(f'insert error: {e}')
         conn.commit()
 
-    # 計算相關係數
     tsmc_df = _read_prices(conn, '2330.TW')
     quanta_df = _read_prices(conn, '2382.TW')
+    log.append(f'DB: tsmc={len(tsmc_df)} quanta={len(quanta_df)}')
+
     merged = pd.merge(tsmc_df, quanta_df, on='trade_date', suffixes=('_tsmc', '_quanta'))
-    merged = merged.dropna()
+    merged = merged[merged['close_price_tsmc'].notna() & merged['close_price_quanta'].notna()]
+    log.append(f'merged={len(merged)}, dtypes={merged.dtypes.to_dict()}')
 
     if len(merged) >= 3:
-        x = merged['close_price_tsmc'].values.astype(float)
-        y = merged['close_price_quanta'].values.astype(float)
-        corr, pval = stats.pearsonr(x, y)
+        x = np.array([float(v) for v in merged['close_price_tsmc']])
+        y = np.array([float(v) for v in merged['close_price_quanta']])
+        corr, pval = _pearsonr(x, y)
         with conn.cursor() as cur:
             cur.execute(
                 '''
@@ -182,15 +213,21 @@ def fetch_and_store():
                 (
                     datetime.now().strftime('%Y-%m-%d'),
                     PERIOD_DAYS,
-                    round(float(corr), 6),
-                    round(float(pval), 8),
+                    round(corr, 6),
+                    round(pval, 8) if pval else None,
                     len(merged),
                 ),
             )
         conn.commit()
+        log.append(f'corr={corr:.4f}')
 
     conn.close()
-    return rows_upserted
+    return rows_upserted, log
+
+
+@app.route('/api/version')
+def api_version():
+    return jsonify({'version': VERSION, 'time': datetime.now().isoformat()})
 
 
 @app.route('/')
@@ -201,10 +238,12 @@ def index():
 @app.route('/api/update', methods=['POST'])
 def api_update():
     try:
-        n = fetch_and_store()
-        return jsonify({'status': 'ok', 'rows': n})
+        n, log = fetch_and_store()
+        return jsonify({'status': 'ok', 'rows': n, 'log': log})
     except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        import traceback
+        return jsonify({'status': 'error', 'message': str(e),
+                        'trace': traceback.format_exc()}), 500
 
 
 @app.route('/api/chart-data')
@@ -214,7 +253,7 @@ def api_chart_data():
     tsmc_df = _read_prices(conn, '2330.TW')
     quanta_df = _read_prices(conn, '2382.TW')
     merged = pd.merge(tsmc_df, quanta_df, on='trade_date', suffixes=('_tsmc', '_quanta'))
-    merged = merged.dropna()
+    merged = merged[merged['close_price_tsmc'].notna() & merged['close_price_quanta'].notna()]
 
     with conn.cursor() as cur:
         cur.execute(
@@ -232,8 +271,8 @@ def api_chart_data():
             'data_points': 0, 'last_updated': None,
         })
 
-    tsmc_close = merged['close_price_tsmc'].astype(float)
-    quanta_close = merged['close_price_quanta'].astype(float)
+    tsmc_close = pd.to_numeric(merged['close_price_tsmc'], errors='coerce')
+    quanta_close = pd.to_numeric(merged['close_price_quanta'], errors='coerce')
 
     norm_tsmc = (tsmc_close / tsmc_close.iloc[0] * 100).round(4).tolist()
     norm_quanta = (quanta_close / quanta_close.iloc[0] * 100).round(4).tolist()
@@ -247,7 +286,7 @@ def api_chart_data():
         'quanta_norm': norm_quanta,
         'rolling_corr': rolling_corr,
         'correlation': float(corr_row['correlation']) if corr_row else None,
-        'p_value': float(corr_row['p_value']) if corr_row else None,
+        'p_value': float(corr_row['p_value']) if corr_row and corr_row['p_value'] else None,
         'data_points': int(corr_row['data_points']) if corr_row else 0,
         'last_updated': str(corr_row['calc_date']) if corr_row else None,
     })
