@@ -15,6 +15,16 @@ SYMBOLS = {'台積電': '2330.TW', '廣達': '2382.TW'}
 PERIOD_DAYS = 365
 
 
+@app.before_request
+def _ensure_db():
+    """gunicorn 啟動後第一次收到請求時建立資料表。"""
+    app.before_request_funcs[None].remove(_ensure_db)
+    try:
+        init_db()
+    except Exception as e:
+        app.logger.error(f'init_db failed: {e}')
+
+
 def get_conn():
     return pymysql.connect(
         host=os.environ.get('MYSQL_HOST', 'localhost'),
