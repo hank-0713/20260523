@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台積電 vs 廣達｜股價關聯性分析</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    body { background: #f0f2f5; font-family: 'Segoe UI', sans-serif; }
+    .navbar { background: linear-gradient(90deg, #003f8a, #0066cc); }
+    .stat-card {
+      background: white;
+      border-radius: 12px;
+      padding: 1.4rem 1rem;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    }
+    .stat-value { font-size: 1.9rem; font-weight: 700; color: #0d6efd; }
+    .stat-label { color: #6c757d; font-size: .85rem; margin-top: .3rem; }
+    .chart-card {
+      background: white;
+      border-radius: 12px;
+      padding: 1rem 1.2rem;
+      box-shadow: 0 2px 8px rgba(0,0,0,.08);
+    }
+    #statusAlert { transition: all .3s; }
+  </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark px-4 py-3 mb-4">
+  <span class="navbar-brand fw-bold fs-5">📈 台積電 vs 廣達｜股價關聯性分析</span>
+  <div class="d-flex align-items-center gap-3">
+    <span class="text-white-50 small">資料來源：Yahoo Finance</span>
+    <button id="updateBtn" class="btn btn-light btn-sm fw-semibold" onclick="updateData()">
+      ↻ 更新資料
+    </button>
+  </div>
+</nav>
+
+<div class="container-fluid px-4">
+
+  <div id="statusAlert" class="alert d-none mb-3" role="alert"></div>
+
+  <!-- 統計卡片 -->
+  <div class="row g-3 mb-4">
+    <div class="col-6 col-md-3">
+      <div class="stat-card">
+        <div class="stat-value" id="corrValue">—</div>
+        <div class="stat-label">皮爾森相關係數</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card">
+        <div class="stat-value" id="corrStrength">—</div>
+        <div class="stat-label">相關強度</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card">
+        <div class="stat-value" id="dataPoints">—</div>
+        <div class="stat-label">資料天數</div>
+      </div>
+    </div>
+    <div class="col-6 col-md-3">
+      <div class="stat-card">
+        <div class="stat-value fs-5" id="lastUpdated">—</div>
+        <div class="stat-label">最後更新</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 主圖：標準化股價 -->
+  <div class="chart-card mb-4">
+    <div id="priceChart" style="height:420px"></div>
+  </div>
+
+  <!-- 散佈圖 + 滾動相關 -->
+  <div class="row g-4 mb-4">
+    <div class="col-md-6">
+      <div class="chart-card">
+        <div id="scatterChart" style="height:400px"></div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="chart-card">
+        <div id="rollingChart" style="height:400px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 原始股價 -->
+  <div class="chart-card mb-4">
+    <div id="rawPriceChart" style="height:380px"></div>
+  </div>
+
+</div>
+
+<script>
+const BLUE = '#0d6efd';
+const RED  = '#dc3545';
+const ORANGE = '#fd7e14';
+const layout_base = {
+  paper_bgcolor: 'white',
+  plot_bgcolor: '#fafbfc',
+  margin: { t: 50, b: 50, l: 60, r: 20 },
+  legend: { orientation: 'h', y: -0.15 },
+  font: { family: 'Segoe UI, sans-serif', size: 13 },
+};
+
+function corrStrengthLabel(r) {
+  const a = Math.abs(r);
+  if (a >= 0.9) return '極強相關';
+  if (a >= 0.7) return '強相關';
+  if (a >= 0.5) return '中度相關';
+  if (a >= 0.3) return '弱相關';
+  return '幾乎無相關';
+}
+
+function linReg(x, y) {
+  const n = x.length;
+  const mx = x.reduce((a,b)=>a+b,0)/n, my = y.reduce((a,b)=>a+b,0)/n;
+  let num=0, den=0;
+  for(let i=0;i<n;i++){ num+=(x[i]-mx)*(y[i]-my); den+=(x[i]-mx)**2; }
+  const slope = den ? num/den : 0;
+  const intercept = my - slope*mx;
+  const xMin=Math.min(...x), xMax=Math.max(...x);
+  return { xs:[xMin,xMax], ys:[slope*xMin+intercept, slope*xMax+intercept] };
+}
+
+async function loadData() {
+  const res = await fetch('/api/chart-data');
+  const d = await res.json();
+
+  // 統計卡片
+  if (d.correlation !== null) {
+    document.getElementById('corrValue').textContent = d.correlation.toFixed(4);
+    document.getElementById('corrStrength').textContent = corrStrengthLabel(d.correlation);
+    const el = document.getElementById('corrValue');
+    el.style.color = Math.abs(d.correlation) >= 0.5 ? '#198754' : '#dc3545';
+  }
+  document.getElementById('dataPoints').textContent = d.data_points || '0';
+  document.getElementById('lastUpdated').textContent = d.last_updated || '尚未更新';
+
+  if (!d.dates || d.dates.length === 0) return;
+
+  // 圖1：標準化走勢
+  Plotly.newPlot('priceChart', [
+    { x: d.dates, y: d.tsmc_norm, name: '台積電 (2330)', line: { color: BLUE, width: 2 } },
+    { x: d.dates, y: d.quanta_norm, name: '廣達 (2382)', line: { color: RED, width: 2 } },
+  ], {
+    ...layout_base,
+    title: { text: '股價走勢比較（期初基準 = 100）', font: { size: 16 } },
+    xaxis: { title: '日期', gridcolor: '#e9ecef' },
+    yaxis: { title: '相對指數', gridcolor: '#e9ecef' },
+  }, { responsive: true });
+
+  // 圖2：散佈圖 + 迴歸線
+  const reg = linReg(d.tsmc_price, d.quanta_price);
+  Plotly.newPlot('scatterChart', [
+    {
+      x: d.tsmc_price, y: d.quanta_price,
+      mode: 'markers', type: 'scatter', name: '日收盤價',
+      marker: { color: '#198754', opacity: 0.5, size: 6 },
+    },
+    {
+      x: reg.xs, y: reg.ys,
+      mode: 'lines', name: '迴歸線',
+      line: { color: '#fd7e14', width: 2, dash: 'dot' },
+    },
+  ], {
+    ...layout_base,
+    title: { text: '散佈圖（含迴歸線）', font: { size: 16 } },
+    xaxis: { title: '台積電收盤價 (TWD)', gridcolor: '#e9ecef' },
+    yaxis: { title: '廣達收盤價 (TWD)', gridcolor: '#e9ecef' },
+  }, { responsive: true });
+
+  // 圖3：30日滾動相關係數
+  Plotly.newPlot('rollingChart', [
+    {
+      x: d.dates, y: d.rolling_corr,
+      name: '30日滾動相關',
+      fill: 'tozeroy', fillcolor: 'rgba(253,126,20,0.15)',
+      line: { color: ORANGE, width: 2 },
+    },
+    {
+      x: [d.dates[0], d.dates[d.dates.length - 1]], y: [0, 0],
+      mode: 'lines', showlegend: false,
+      line: { color: '#adb5bd', dash: 'dash', width: 1 },
+    },
+  ], {
+    ...layout_base,
+    title: { text: '30 日滾動相關係數', font: { size: 16 } },
+    xaxis: { title: '日期', gridcolor: '#e9ecef' },
+    yaxis: { title: '相關係數', range: [-1, 1], gridcolor: '#e9ecef',
+             tickvals: [-1,-0.5,0,0.5,1] },
+  }, { responsive: true });
+
+  // 圖4：原始股價（雙 Y 軸）
+  Plotly.newPlot('rawPriceChart', [
+    { x: d.dates, y: d.tsmc_price, name: '台積電 (2330)', yaxis: 'y1', line: { color: BLUE, width: 1.5 } },
+    { x: d.dates, y: d.quanta_price, name: '廣達 (2382)', yaxis: 'y2', line: { color: RED, width: 1.5 } },
+  ], {
+    ...layout_base,
+    title: { text: '原始股價走勢（雙 Y 軸）', font: { size: 16 } },
+    xaxis: { title: '日期', gridcolor: '#e9ecef' },
+    yaxis: { title: '台積電 (TWD)', titlefont: { color: BLUE }, tickfont: { color: BLUE }, gridcolor: '#e9ecef' },
+    yaxis2: { title: '廣達 (TWD)', titlefont: { color: RED }, tickfont: { color: RED }, overlaying: 'y', side: 'right' },
+  }, { responsive: true });
+}
+
+async function updateData() {
+  const btn = document.getElementById('updateBtn');
+  const alert = document.getElementById('statusAlert');
+  btn.disabled = true;
+  btn.textContent = '更新中…';
+  alert.className = 'alert alert-info';
+  alert.textContent = '正在從 Yahoo Finance 抓取資料，請稍候（約 10–30 秒）…';
+
+  try {
+    const res = await fetch('/api/update', { method: 'POST' });
+    const result = await res.json();
+    if (result.status === 'ok') {
+      alert.className = 'alert alert-success';
+      alert.textContent = `✓ 更新成功，共處理 ${result.rows} 筆資料。`;
+      await loadData();
+    } else {
+      alert.className = 'alert alert-danger';
+      alert.textContent = `✗ 更新失敗：${result.message}`;
+    }
+  } catch (e) {
+    alert.className = 'alert alert-danger';
+    alert.textContent = `✗ 請求失敗：${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ 更新資料';
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>
